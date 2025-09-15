@@ -13,13 +13,9 @@ const logger = pino({ level: "info" })
 const app = express()
 let latestQrDataUrl = null
 
-// Leer IDs desde variables de entorno (configura esto en Render)
-const GROUP_1 = process.env.GROUP_1 || "" // Grupo origen (donde se escribe "fraude")
-const GROUP_2 = process.env.GROUP_2 || "" // Grupo destino (a donde se reenvía)
-
-if (!GROUP_1 || !GROUP_2) {
-  logger.warn("VARIABLES: Define GROUP_1 y GROUP_2 en las env vars (ej: 1203...@g.us)")
-}
+// ✅ Tus grupos originales
+const GROUP_1 = "120363403320326307@g.us" // Grupo origen (donde escriben "fraude")
+const GROUP_2 = "120363403008545576@g.us" // Grupo destino (a donde se reenvía)
 
 async function startBot() {
   try {
@@ -33,7 +29,7 @@ async function startBot() {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, logger)
       },
-      printQRInTerminal: false // no imprimimos automático; usamos /qr
+      printQRInTerminal: false // mostramos el QR en /qr, no en consola
     })
 
     sock.ev.on("creds.update", saveCreds)
@@ -42,10 +38,9 @@ async function startBot() {
       const { connection, lastDisconnect, qr } = update
 
       if (qr) {
-        // generar dataURL del QR para la ruta /qr
         try {
           latestQrDataUrl = await QRCode.toDataURL(qr)
-          logger.info("QR actualizado — visita /qr para escanear")
+          logger.info("📲 QR actualizado — visita /qr para escanearlo")
         } catch (e) {
           logger.error("Error generando QR:", e)
         }
@@ -57,8 +52,7 @@ async function startBot() {
       }
 
       if (connection === "close") {
-        logger.warn("Conexión cerrada:", lastDisconnect?.error ?? "unknown")
-        // intentar reconectar automática
+        logger.warn("⚠️ Conexión cerrada:", lastDisconnect?.error ?? "unknown")
         startBot().catch((e) => logger.error("Error reiniciando bot:", e))
       }
     })
@@ -67,45 +61,37 @@ async function startBot() {
       const m = messages[0]
       if (!m || !m.message) return
 
-      // Evitar procesar nuestros propios mensajes
-      if (m.key.fromMe) return
+      if (m.key.fromMe) return // ignorar mis propios mensajes
 
       const chatId = m.key.remoteJid
-      // extraer texto (puede venir en conversation o extendedTextMessage)
-      const text = m.message.conversation || m.message.extendedTextMessage?.text || ""
+      const text =
+        m.message.conversation || m.message.extendedTextMessage?.text || ""
 
       logger.info(`📩 [${chatId}] ${text}`)
 
-      // Si viene del GROUP_1 y contiene "fraude"
+      // 🚨 Detectar "fraude" en el grupo 1 y reenviar al grupo 2
       if (chatId === GROUP_1 && text.toLowerCase().includes("fraude")) {
         logger.info("🚨 FRAUDE detectado, reenviando...")
 
         try {
-          // Intentamos reenviar tal cual (relayMessage)
           await sock.relayMessage(GROUP_2, m.message, { messageId: m.key.id })
           logger.info("✅ Mensaje reenviado con relayMessage")
         } catch (err) {
-          logger.warn("relayMessage falló, enviando fallback de texto:", err?.message || err)
-          // Fallback: enviar solo texto (si el forward falla por keys)
+          logger.warn("relayMessage falló, usando fallback:", err?.message)
           const fallbackText = `🚨 Mensaje reenviado del Grupo 1:\n"${text}"`
-          try {
-            await sock.sendMessage(GROUP_2, { text: fallbackText })
-            logger.info("✅ Mensaje reenviado por fallback (texto)")
-          } catch (e2) {
-            logger.error("❌ Error reenviando por fallback:", e2)
-          }
+          await sock.sendMessage(GROUP_2, { text: fallbackText })
+          logger.info("✅ Mensaje reenviado con fallback (texto)")
         }
       }
     })
   } catch (e) {
     logger.error("Error en startBot():", e)
-    // reintentar en X segundos podría hacerse aquí, pero Render reiniciará el proceso si falla
   }
 }
 
 startBot()
 
-// Rutas web
+// Rutas web (para Render)
 app.get("/qr", (req, res) => {
   if (!latestQrDataUrl) {
     return res.send(`<h3>No hay QR disponible (ya emparejado o esperando).</h3>
@@ -120,4 +106,4 @@ app.get("/qr", (req, res) => {
 app.get("/health", (req, res) => res.send("ok"))
 
 const PORT = process.env.PORT || 3000
-app.listen(PORT, () => logger.info(`Server listening on port ${PORT}`))
+app.listen(PORT, () => logger.info(`🌐 Server escuchando en puerto ${PORT}`))
