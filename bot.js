@@ -1,24 +1,24 @@
 // bot.js
-import express from "express"
+// Copia y pega TODO este archivo (mantiene tu lógica de grupos + muestra QR en la consola)
+
 import makeWASocket, {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore
-} from "@whiskeysockets/baileys"
-import QRCode from "qrcode"
+} from "baileys"
+import qrcodeTerminal from "qrcode-terminal"
 import pino from "pino"
-import fs from "fs"
 
 const logger = pino({ level: "info" })
-const app = express()
-let latestQrDataUrl = null
 
-// ✅ Tus grupos originales
+// === CONFIGURACIÓN: usa tus IDs de grupo tal como los tenías ===
 const GROUP_1 = "120363403320326307@g.us" // Grupo origen (donde escriben "fraude")
 const GROUP_2 = "120363403008545576@g.us" // Grupo destino (a donde se reenvía)
+// ==================================================================
 
 async function startBot() {
   try {
+    // carga/crea auth en ./auth
     const { state, saveCreds } = await useMultiFileAuthState("./auth")
     const { version } = await fetchLatestBaileysVersion()
 
@@ -29,59 +29,82 @@ async function startBot() {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, logger)
       },
-      printQRInTerminal: false // mostramos el QR en /qr, no en consola
+      // No confiamos en printQRInTerminal (deprecated): nosotros mostramos el QR cuando llegue el evento.
+      printQRInTerminal: false
     })
 
+    // Guardar credenciales cuando cambien
     sock.ev.on("creds.update", saveCreds)
 
+    // Connection updates: qr, open, close
     sock.ev.on("connection.update", async (update) => {
-      const { connection, lastDisconnect, qr } = update
+      try {
+        const { connection, lastDisconnect, qr } = update
 
-      if (qr) {
-        try {
-          latestQrDataUrl = await QRCode.toDataURL(qr)
-          logger.info("📲 QR actualizado — visita /qr para escanearlo")
-        } catch (e) {
-          logger.error("Error generando QR:", e)
+        if (qr) {
+          // Mostrar QR en consola (ASCII)
+          logger.info("📲 QR actualizado — escanea este QR con WhatsApp → Dispositivos → Vincular dispositivo")
+          qrcodeTerminal.generate(qr, { small: true })
+          // Además imprimimos el string por si necesitas pegarlo en otro generador:
+          console.log("\n--- QR STRING (opcional) ---\n", qr, "\n")
         }
-      }
 
-      if (connection === "open") {
-        logger.info("✅ Bot conectado a WhatsApp")
-        latestQrDataUrl = null
-      }
+        if (connection === "open") {
+          logger.info("✅ Bot conectado a WhatsApp")
+        }
 
-      if (connection === "close") {
-        logger.warn("⚠️ Conexión cerrada:", lastDisconnect?.error ?? "unknown")
-        startBot().catch((e) => logger.error("Error reiniciando bot:", e))
+        if (connection === "close") {
+          logger.warn("⚠️ Conexión cerrada:", lastDisconnect?.error ?? "unknown")
+          // Reintentar reconectar automáticamente
+          try {
+            await startBot()
+          } catch (e) {
+            logger.error("Error reiniciando bot:", e)
+          }
+        }
+      } catch (e) {
+        logger.error("Error en connection.update handler:", e)
       }
     })
 
+    // Mensajes entrantes
     sock.ev.on("messages.upsert", async ({ messages }) => {
-      const m = messages[0]
-      if (!m || !m.message) return
+      try {
+        const m = messages[0]
+        if (!m || !m.message) return
+        if (m.key.fromMe) return // ignorar mensajes que enviamos nosotros
 
-      if (m.key.fromMe) return // ignorar mis propios mensajes
+        const chatId = m.key.remoteJid
+        const text =
+          m.message.conversation ||
+          m.message.extendedTextMessage?.text ||
+          (m.message?.imageMessage?.caption) ||
+          ""
 
-      const chatId = m.key.remoteJid
-      const text =
-        m.message.conversation || m.message.extendedTextMessage?.text || ""
+        logger.info(`📩 [${chatId}] ${text}`)
 
-      logger.info(`📩 [${chatId}] ${text}`)
+        // Detectar palabra "fraude" (insensible a mayúsculas) y reenviar solo si viene del GROUP_1
+        if (chatId === GROUP_1 && String(text).toLowerCase().includes("fraude")) {
+          logger.info("🚨 FRAUDE detectado, reenviando...")
 
-      // 🚨 Detectar "fraude" en el grupo 1 y reenviar al grupo 2
-      if (chatId === GROUP_1 && text.toLowerCase().includes("fraude")) {
-        logger.info("🚨 FRAUDE detectado, reenviando...")
-
-        try {
-          await sock.relayMessage(GROUP_2, m.message, { messageId: m.key.id })
-          logger.info("✅ Mensaje reenviado con relayMessage")
-        } catch (err) {
-          logger.warn("relayMessage falló, usando fallback:", err?.message)
-          const fallbackText = `🚨 Mensaje reenviado del Grupo 1:\n"${text}"`
-          await sock.sendMessage(GROUP_2, { text: fallbackText })
-          logger.info("✅ Mensaje reenviado con fallback (texto)")
+          try {
+            // Intentar reenviar el mensaje original (manteniendo tipo/media) con relayMessage
+            await sock.relayMessage(GROUP_2, m.message, { messageId: m.key.id })
+            logger.info("✅ Mensaje reenviado con relayMessage")
+          } catch (err) {
+            // Si falla (por cifrado/keys), hacer fallback a texto
+            logger.warn("relayMessage falló, usando fallback (texto):", err?.message || err)
+            const fallbackText = `🚨 Mensaje reenviado del Grupo 1:\n"${text}"`
+            try {
+              await sock.sendMessage(GROUP_2, { text: fallbackText })
+              logger.info("✅ Mensaje reenviado con fallback (texto)")
+            } catch (e2) {
+              logger.error("❌ Error reenviando por fallback:", e2)
+            }
+          }
         }
+      } catch (e) {
+        logger.error("Error procesando messages.upsert:", e)
       }
     })
   } catch (e) {
@@ -89,21 +112,5 @@ async function startBot() {
   }
 }
 
+// Arranca el bot
 startBot()
-
-// Rutas web (para Render)
-app.get("/qr", (req, res) => {
-  if (!latestQrDataUrl) {
-    return res.send(`<h3>No hay QR disponible (ya emparejado o esperando).</h3>
-      <p>Si necesitas emparejar, reinicia el servicio o revisa logs.</p>`)
-  }
-  res.send(`<html><body>
-    <h3>Escanea este QR con WhatsApp → Dispositivos → Vincular dispositivo</h3>
-    <img src="${latestQrDataUrl}" alt="QR"/>
-    </body></html>`)
-})
-
-app.get("/health", (req, res) => res.send("ok"))
-
-const PORT = process.env.PORT || 3000
-app.listen(PORT, () => logger.info(`🌐 Server escuchando en puerto ${PORT}`))
